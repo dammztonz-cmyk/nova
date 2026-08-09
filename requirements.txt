@@ -1,0 +1,11 @@
+# Core dependencies (required)
+discord.py>=2.3.0
+google-generativeai>=0.3.0
+python-dotenv>=1.0.0
+
+# Optional: voice transcription (recommended)
+openai-whisper>=20231117
+pydub>=0.25.1
+
+# Optional: PostgreSQL support (comment out if using SQLite only)
+psycopg2-binary>=2.9.9
