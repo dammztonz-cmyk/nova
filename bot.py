@@ -4,7 +4,7 @@
 #
 # Core features:
 # - Discord.py bot
-# - Gemini AI
+# - Groq AI (openai/gpt-oss-120b by default)
 # - User identification by Discord ID
 # - SQLite temporary storage
 # - PostgreSQL permanent storage
@@ -44,18 +44,19 @@
 #    the DB never had a mechanism to set anything but
 #    "private" before.
 #
-# Everything about the AI personality, Gemini prompting,
+# Everything about the AI personality, Groq prompting,
 # memory classification, and challenge generation is left
 # functionally the same as before.
 #
 # Install:
-# pip install discord.py python-dotenv asyncpg google-genai
+# pip install discord.py python-dotenv asyncpg groq
 #
 # .env:
 # DISCORD_TOKEN=your_discord_bot_token
-# GEMINI_API_KEY=your_gemini_api_key
+# GROQ_API_KEY=your_groq_api_key
 # DATABASE_URL=your_postgresql_database_url
 # BOT_PREFIX=!
+# GROQ_MODEL=openai/gpt-oss-120b
 # ============================================================
 
 
@@ -81,8 +82,7 @@ from discord.ext import commands, tasks
 
 import asyncpg
 
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 
 
 # ============================================================
@@ -102,7 +102,7 @@ logging.basicConfig(
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
@@ -117,9 +117,9 @@ if not DISCORD_TOKEN:
         "DISCORD_TOKEN is missing from the environment."
     )
 
-if not GEMINI_API_KEY:
+if not GROQ_API_KEY:
     raise RuntimeError(
-        "GEMINI_API_KEY is missing from the environment."
+        "GROQ_API_KEY is missing from the environment."
     )
 
 if not DATABASE_URL:
@@ -135,10 +135,18 @@ if not DATABASE_URL:
 
 SQLITE_DATABASE = "bot_temp.db"
 
-# Gemini model
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.0-flash"
+# Groq model.
+#
+# NOTE: Groq has deprecated its older Llama chat models
+# (llama-3.3-70b-versatile, llama-3.1-8b-instant). The current
+# recommended general-purpose production model is
+# openai/gpt-oss-120b, with openai/gpt-oss-20b as a smaller/
+# faster alternative. Check https://console.groq.com/docs/models
+# for the current lineup before deploying, since Groq's model
+# list changes frequently.
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-120b"
 )
 
 # Number of messages kept for short-term context
@@ -153,11 +161,11 @@ DAILY_CHALLENGE_MINUTE = 0
 
 
 # ============================================================
-# GEMINI CLIENT
+# GROQ CLIENT
 # ============================================================
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
+groq_client = AsyncGroq(
+    api_key=GROQ_API_KEY
 )
 
 
@@ -990,7 +998,7 @@ async def get_user_memories(
 
 
 # ============================================================
-# GEMINI RESPONSE
+# GROQ RESPONSE
 # ============================================================
 
 async def generate_ai_response(
@@ -1001,7 +1009,7 @@ async def generate_ai_response(
     context=""
 ):
     """
-    Generate an AI response using Gemini.
+    Generate an AI response using Groq.
     """
 
     # These DB lookups are wrapped individually so that a
@@ -1072,26 +1080,38 @@ CURRENT USER MESSAGE:
 
     try:
 
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=AI_SYSTEM_INSTRUCTION
-            )
+        response = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": AI_SYSTEM_INSTRUCTION
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
         )
 
-        if not response or not response.text:
+        text = response.choices[0].message.content
+
+        if not text:
             return (
                 "I couldn't generate a response right now."
             )
 
-        return response.text.strip()
+        return text.strip()
 
     except Exception as error:
 
+        print("=" * 60, flush=True)
+        print("ERROR calling Groq (generate_ai_response):", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
+
         logging.exception(
-            "Gemini error: %s",
+            "Groq error: %s",
             error
         )
 
@@ -1110,7 +1130,7 @@ async def classify_memory(
     user_id
 ):
     """
-    Ask Gemini whether information is worth remembering.
+    Ask the model whether information is worth remembering.
 
     This is intentionally simple for the first version.
     """
@@ -1155,15 +1175,20 @@ Information:
 
     try:
 
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt
+        response = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            response_format={"type": "json_object"}
         )
 
-        raw = response.text.strip()
+        raw = response.choices[0].message.content.strip()
 
-        # Remove markdown fences if Gemini adds them.
+        # Remove markdown fences if the model adds them anyway.
         if raw.startswith("```"):
             raw = raw.replace("```json", "")
             raw = raw.replace("```", "")
@@ -1202,6 +1227,11 @@ Information:
         }
 
     except Exception as error:
+
+        print("=" * 60, flush=True)
+        print("ERROR calling Groq (classify_memory):", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
 
         logging.exception(
             "Memory classification error: %s",
@@ -1288,7 +1318,7 @@ CHALLENGE_TOPICS = [
 
 async def generate_daily_challenge():
     """
-    Ask Gemini to generate one Python challenge.
+    Ask Groq to generate one Python challenge.
     """
 
     difficulty = random.choice(
@@ -1327,13 +1357,18 @@ The solution should be a valid Python solution.
 
     try:
 
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt
+        response = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            response_format={"type": "json_object"}
         )
 
-        raw = response.text.strip()
+        raw = response.choices[0].message.content.strip()
 
         if raw.startswith("```"):
             raw = raw.replace("```json", "")
@@ -1345,6 +1380,11 @@ The solution should be a valid Python solution.
         return challenge
 
     except Exception as error:
+
+        print("=" * 60, flush=True)
+        print("ERROR calling Groq (generate_daily_challenge):", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
 
         logging.exception(
             "Challenge generation error: %s",
@@ -1691,7 +1731,7 @@ async def status_command(ctx):
     await ctx.send(
         "Bot status:\n"
         f"Discord: connected\n"
-        f"Gemini: connected\n"
+        f"Groq: connected\n"
         f"PostgreSQL: {postgres_status}\n"
         f"SQLite: connected"
     )
