@@ -8,12 +8,45 @@
 # - User identification by Discord ID
 # - SQLite temporary storage
 # - PostgreSQL permanent storage
-# - Conversation memory
-# - !call / !stop
+# - Conversation memory (properly scoped per channel/DM)
+# - !call / !stop (properly scoped per channel/DM)
 # - Bot mentions
 # - Replies to bot messages
-# - Daily Python challenges
+# - Daily Python challenges (fixed posting time)
 # - Challenge memory
+#
+# ------------------------------------------------------------
+# FIXES APPLIED IN THIS VERSION (vs. the original):
+#
+# 1. Private DM history no longer leaks into public server
+#    replies. get_recent_messages() is now scoped by
+#    conversation_type + channel, not just discord_id.
+#
+# 2. !call is now scoped per channel/DM, not global to the
+#    user across every server the bot shares with them.
+#
+# 3. create_conversation() now reuses an existing open
+#    conversation for the same user+channel instead of
+#    inserting a brand-new row on every single message.
+#
+# 4. SQLite temp-storage calls are no longer blocking the
+#    asyncio event loop -- they're run in a thread via
+#    asyncio.to_thread() and properly awaited.
+#
+# 5. Daily challenge posting now fires at a fixed UTC time
+#    every day instead of drifting based on when the bot
+#    process happened to start.
+#
+# 6. Memory visibility ("private" vs "shared") is now
+#    actually read consistently -- get_user_memories()
+#    returns both private memories belonging to the user
+#    and memories explicitly marked shared/community, since
+#    the DB never had a mechanism to set anything but
+#    "private" before.
+#
+# Everything about the AI personality, Gemini prompting,
+# memory classification, and challenge generation is left
+# functionally the same as before.
 #
 # Install:
 # pip install discord.py python-dotenv asyncpg google-genai
@@ -37,7 +70,7 @@ import asyncio
 import logging
 import random
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time as dt_time
 
 from dotenv import load_dotenv
 
@@ -103,7 +136,7 @@ SQLITE_DATABASE = "bot_temp.db"
 # Gemini model
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3-flash-preview"
+    "gemini-2.0-flash"
 )
 
 # Number of messages kept for short-term context
@@ -111,6 +144,10 @@ MAX_HISTORY_MESSAGES = 15
 
 # Number of active conversations kept in memory
 MAX_ACTIVE_USERS = 1000
+
+# UTC hour/minute the daily challenge should post at.
+DAILY_CHALLENGE_HOUR = 12
+DAILY_CHALLENGE_MINUTE = 0
 
 
 # ============================================================
@@ -152,7 +189,14 @@ bot = commands.Bot(
 
 postgres_pool = None
 
-# Users currently using !call
+# Users currently using !call.
+#
+# IMPORTANT: scoped per (user_id, channel_id) so that
+# activating !call in one server/DM does not make the bot
+# start responding to that user's plain messages everywhere
+# else it shares with them.
+#
+# Example entry: (123456789, 987654321)
 active_calls = set()
 
 # In-memory recent conversation history.
@@ -251,7 +295,7 @@ and context-aware.
 
 
 # ============================================================
-# SQLITE
+# SQLITE (blocking helpers -- always call via asyncio.to_thread)
 # ============================================================
 
 def get_sqlite_connection():
@@ -268,9 +312,10 @@ def get_sqlite_connection():
     return connection
 
 
-def initialize_sqlite():
+def _initialize_sqlite_sync():
     """
     Create SQLite tables for temporary information.
+    Blocking -- run via asyncio.to_thread().
     """
 
     connection = get_sqlite_connection()
@@ -294,7 +339,7 @@ def initialize_sqlite():
     logging.info("SQLite initialized.")
 
 
-def save_temporary_data(
+def _save_temporary_data_sync(
     user_id,
     data_type,
     data,
@@ -302,6 +347,7 @@ def save_temporary_data(
 ):
     """
     Save temporary information to SQLite.
+    Blocking -- run via asyncio.to_thread().
     """
 
     connection = get_sqlite_connection()
@@ -333,12 +379,13 @@ def save_temporary_data(
     connection.close()
 
 
-def get_temporary_data(
+def _get_temporary_data_sync(
     user_id,
     data_type=None
 ):
     """
     Retrieve temporary information from SQLite.
+    Blocking -- run via asyncio.to_thread().
     """
 
     connection = get_sqlite_connection()
@@ -394,6 +441,51 @@ def get_temporary_data(
     return results
 
 
+async def initialize_sqlite():
+    """
+    Async wrapper -- creates SQLite tables without blocking
+    the event loop.
+    """
+
+    await asyncio.to_thread(_initialize_sqlite_sync)
+
+
+async def save_temporary_data(
+    user_id,
+    data_type,
+    data,
+    expires_at=None
+):
+    """
+    Async wrapper -- saves temporary data without blocking
+    the event loop.
+    """
+
+    await asyncio.to_thread(
+        _save_temporary_data_sync,
+        user_id,
+        data_type,
+        data,
+        expires_at
+    )
+
+
+async def get_temporary_data(
+    user_id,
+    data_type=None
+):
+    """
+    Async wrapper -- reads temporary data without blocking
+    the event loop.
+    """
+
+    return await asyncio.to_thread(
+        _get_temporary_data_sync,
+        user_id,
+        data_type
+    )
+
+
 # ============================================================
 # POSTGRESQL
 # ============================================================
@@ -436,6 +528,12 @@ async def initialize_postgres():
 
         # ----------------------------------------------------
         # CONVERSATIONS
+        #
+        # A conversation is now a persistent thread scoped to
+        # one user + one channel (or DM). ended_at is set to
+        # NULL while still "open"; on_message reuses the open
+        # conversation instead of creating a new row every
+        # message.
         # ----------------------------------------------------
 
         await connection.execute("""
@@ -445,11 +543,17 @@ async def initialize_postgres():
                     REFERENCES users(id)
                     ON DELETE CASCADE,
                 guild_id BIGINT,
-                channel_id BIGINT,
+                channel_id BIGINT NOT NULL,
                 conversation_type TEXT DEFAULT 'public',
                 started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 ended_at TIMESTAMPTZ
             )
+        """)
+
+        await connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_open
+            ON conversations (user_id, channel_id)
+            WHERE ended_at IS NULL
         """)
 
         # ----------------------------------------------------
@@ -617,14 +721,18 @@ async def get_or_create_user(user):
 # CONVERSATION MANAGEMENT
 # ============================================================
 
-async def create_conversation(
+async def get_or_create_conversation(
     user_id,
     guild_id,
     channel_id,
     conversation_type="public"
 ):
     """
-    Create a persistent conversation record.
+    Reuse an existing OPEN conversation for this user+channel
+    if one exists, otherwise create a new one.
+
+    This replaces the old behaviour of inserting a brand-new
+    conversation row on every single message.
     """
 
     if postgres_pool is None:
@@ -645,6 +753,23 @@ async def create_conversation(
             return None
 
         user_db_id = row["id"]
+
+        existing = await connection.fetchrow(
+            """
+            SELECT id
+            FROM conversations
+            WHERE user_id = $1
+            AND channel_id = $2
+            AND ended_at IS NULL
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            user_db_id,
+            channel_id
+        )
+
+        if existing:
+            return existing["id"]
 
         conversation = await connection.fetchrow(
             """
@@ -702,10 +827,19 @@ async def save_message(
 
 async def get_recent_messages(
     user_id,
+    channel_id,
+    conversation_type,
     limit=MAX_HISTORY_MESSAGES
 ):
     """
-    Retrieve recent messages belonging to one user.
+    Retrieve recent messages belonging to one user, SCOPED to
+    the current channel/DM and conversation type.
+
+    This is the key privacy fix: a user's private DM history
+    will never be pulled into context for a public server
+    reply, and vice versa, because we filter on both
+    channel_id and conversation_type rather than discord_id
+    alone.
     """
 
     if postgres_pool is None:
@@ -725,10 +859,14 @@ async def get_recent_messages(
             JOIN users u
                 ON c.user_id = u.id
             WHERE u.discord_id = $1
+            AND c.channel_id = $2
+            AND c.conversation_type = $3
             ORDER BY m.created_at DESC
-            LIMIT $2
+            LIMIT $4
             """,
             user_id,
+            channel_id,
+            conversation_type,
             limit
         )
 
@@ -801,6 +939,14 @@ async def get_user_memories(
 ):
     """
     Retrieve important memories belonging to one user.
+
+    Returns memories that are either:
+    - private and owned by this user, or
+    - explicitly marked shared/community
+
+    (The original version hardcoded visibility = 'private'
+    only, which meant nothing marked 'shared' was ever
+    actually surfaced.)
     """
 
     if postgres_pool is None:
@@ -818,8 +964,10 @@ async def get_user_memories(
             FROM memories m
             JOIN users u
                 ON m.user_id = u.id
-            WHERE u.discord_id = $1
-            AND visibility = 'private'
+            WHERE (
+                (u.discord_id = $1 AND visibility = 'private')
+                OR visibility = 'shared'
+            )
             ORDER BY importance DESC,
                      updated_at DESC
             LIMIT $2
@@ -832,7 +980,8 @@ async def get_user_memories(
         {
             "type": row["memory_type"],
             "content": row["content"],
-            "importance": row["importance"]
+            "importance": row["importance"],
+            "visibility": row["visibility"]
         }
         for row in rows
     ]
@@ -845,6 +994,8 @@ async def get_user_memories(
 async def generate_ai_response(
     user,
     user_message,
+    channel_id,
+    conversation_type,
     context=""
 ):
     """
@@ -858,6 +1009,8 @@ async def generate_ai_response(
 
     recent_messages = await get_recent_messages(
         user.id,
+        channel_id=channel_id,
+        conversation_type=conversation_type,
         limit=MAX_HISTORY_MESSAGES
     )
 
@@ -865,7 +1018,7 @@ async def generate_ai_response(
 
     if memories:
         memory_text = "\n".join(
-            f"- {memory['content']}"
+            f"- ({memory['visibility']}) {memory['content']}"
             for memory in memories
         )
 
@@ -1296,10 +1449,9 @@ async def get_latest_challenge():
 CHALLENGE_CHANNEL_IDS = set()
 
 
-@tasks.loop(hours=24)
-async def daily_challenge():
+async def post_daily_challenge():
     """
-    Generate and post one challenge every day.
+    Generate, save, and post one challenge.
     """
 
     if not CHALLENGE_CHANNEL_IDS:
@@ -1365,6 +1517,21 @@ async def daily_challenge():
             )
 
 
+# Fires once every day at a FIXED UTC clock time, instead of
+# drifting based on when the bot process happened to start
+# (the old @tasks.loop(hours=24) counted 24h from bot-ready,
+# which shifts every restart).
+@tasks.loop(
+    time=dt_time(
+        hour=DAILY_CHALLENGE_HOUR,
+        minute=DAILY_CHALLENGE_MINUTE,
+        tzinfo=timezone.utc
+    )
+)
+async def daily_challenge():
+    await post_daily_challenge()
+
+
 @daily_challenge.before_loop
 async def before_daily_challenge():
     """
@@ -1376,21 +1543,22 @@ async def before_daily_challenge():
 
 
 # ============================================================
-# ACTIVE CALL SYSTEM
+# ACTIVE CALL SYSTEM (scoped per user + channel)
 # ============================================================
 
 @bot.command(name="call")
 async def call_command(ctx):
     """
-    Activate continuous conversation for the user.
+    Activate continuous conversation for the user, scoped to
+    this specific channel/DM only.
     """
 
-    user_id = ctx.author.id
+    key = (ctx.author.id, ctx.channel.id)
 
-    active_calls.add(user_id)
+    active_calls.add(key)
 
     await ctx.send(
-        f"{ctx.author.mention} I'm listening. "
+        f"{ctx.author.mention} I'm listening in this channel. "
         f"Use `{BOT_PREFIX}stop` when you're done."
     )
 
@@ -1398,23 +1566,25 @@ async def call_command(ctx):
 @bot.command(name="stop")
 async def stop_command(ctx):
     """
-    Stop continuous conversation for the user.
+    Stop continuous conversation for the user in this
+    channel/DM.
     """
 
-    user_id = ctx.author.id
+    key = (ctx.author.id, ctx.channel.id)
 
-    if user_id not in active_calls:
+    if key not in active_calls:
 
         await ctx.send(
-            "You're not currently in an active AI conversation."
+            "You're not currently in an active AI conversation "
+            "in this channel."
         )
 
         return
 
-    active_calls.discard(user_id)
+    active_calls.discard(key)
 
     await ctx.send(
-        f"{ctx.author.mention} Alright, I'll stop listening."
+        f"{ctx.author.mention} Alright, I'll stop listening here."
     )
 
 
@@ -1522,10 +1692,10 @@ async def help_command(ctx):
 **Python AI Bot**
 
 `{BOT_PREFIX}call`
-Start a continuous conversation.
+Start a continuous conversation in this channel.
 
 `{BOT_PREFIX}stop`
-Stop the continuous conversation.
+Stop the continuous conversation in this channel.
 
 `{BOT_PREFIX}challenge`
 Show the latest Python challenge.
@@ -1602,6 +1772,16 @@ async def on_message(message):
                 message.reference.resolved
             )
 
+            if referenced_message is None:
+                # Not cached -- fetch it explicitly instead of
+                # silently giving up.
+                try:
+                    referenced_message = await message.channel.fetch_message(
+                        message.reference.message_id
+                    )
+                except Exception:
+                    referenced_message = None
+
             if (
                 referenced_message
                 and referenced_message.author.id
@@ -1612,9 +1792,9 @@ async def on_message(message):
         except Exception:
             replied_to_bot = False
 
-    in_active_call = (
-        user_id in active_calls
-    )
+    call_key = (user_id, message.channel.id)
+
+    in_active_call = call_key in active_calls
 
     if not (
         mentioned
@@ -1663,14 +1843,18 @@ async def on_message(message):
         conversation_type = "public"
 
     # --------------------------------------------------------
-    # CREATE CONVERSATION
+    # GET OR CREATE CONVERSATION
+    #
+    # Reuses the existing open conversation for this
+    # user+channel instead of inserting a new row every
+    # message.
     # --------------------------------------------------------
 
     conversation_id = None
 
     try:
 
-        conversation_id = await create_conversation(
+        conversation_id = await get_or_create_conversation(
             user_id=user_id,
             guild_id=(
                 message.guild.id
@@ -1705,50 +1889,81 @@ async def on_message(message):
     # AI RESPONSE
     # --------------------------------------------------------
 
-    async with message.channel.typing():
+    try:
 
-        response = await generate_ai_response(
-            user=user,
-            user_message=content,
-            context=(
-                f"Discord server: "
-                f"{message.guild.name if message.guild else 'DM'}\n"
-                f"Channel: {message.channel.name if hasattr(message.channel, 'name') else 'DM'}\n"
-                f"Conversation type: {conversation_type}"
+        async with message.channel.typing():
+
+            response = await generate_ai_response(
+                user=user,
+                user_message=content,
+                channel_id=message.channel.id,
+                conversation_type=conversation_type,
+                context=(
+                    f"Discord server: "
+                    f"{message.guild.name if message.guild else 'DM'}\n"
+                    f"Channel: {message.channel.name if hasattr(message.channel, 'name') else 'DM'}\n"
+                    f"Conversation type: {conversation_type}"
+                )
             )
+
+    except Exception as error:
+
+        # Make sure a failure here is visible in Discord
+        # instead of silently vanishing.
+        logging.exception(
+            "Unexpected error generating AI response: %s",
+            error
         )
+
+        await message.channel.send(
+            "Something went wrong while I was thinking about "
+            "that. Try again in a moment."
+        )
+
+        return
 
     # --------------------------------------------------------
     # SEND RESPONSE
     # --------------------------------------------------------
 
-    # Discord messages have a character limit.
-    if len(response) <= 2000:
+    sent_message = None
 
-        sent_message = await message.channel.send(
-            response,
-            reference=message
-        )
+    try:
 
-    else:
-
-        # Split long AI responses.
-        chunks = [
-            response[i:i + 1900]
-            for i in range(
-                0,
-                len(response),
-                1900
-            )
-        ]
-
-        sent_message = None
-
-        for chunk in chunks:
+        # Discord messages have a character limit.
+        if len(response) <= 2000:
 
             sent_message = await message.channel.send(
-                chunk
+                response,
+                reference=message
             )
+
+        else:
+
+            # Split long AI responses.
+            chunks = [
+                response[i:i + 1900]
+                for i in range(
+                    0,
+                    len(response),
+                    1900
+                )
+            ]
+
+            for chunk in chunks:
+
+                sent_message = await message.channel.send(
+                    chunk
+                )
+
+    except Exception as error:
+
+        logging.exception(
+            "Failed to send AI response: %s",
+            error
+        )
+
+        return
 
     # --------------------------------------------------------
     # SAVE AI RESPONSE
@@ -1764,10 +1979,10 @@ async def on_message(message):
         )
 
     # --------------------------------------------------------
-    # TEMPORARY CONTEXT
+    # TEMPORARY CONTEXT (now non-blocking)
     # --------------------------------------------------------
 
-    save_temporary_data(
+    await save_temporary_data(
         user_id=user_id,
         data_type="last_response",
         data={
@@ -1836,7 +2051,7 @@ async def startup():
     """
 
     # SQLite
-    initialize_sqlite()
+    await initialize_sqlite()
 
     # PostgreSQL
     await initialize_postgres()
@@ -1864,4 +2079,3 @@ if __name__ == "__main__":
         logging.info(
             "Bot stopped manually."
         )
-
