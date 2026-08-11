@@ -1,4 +1,4 @@
-discord.py
-python-dotenv
-asyncpg
-google-genai
+discord.py>=2.3.2
+python-dotenv>=1.0.1
+asyncpg>=0.29.0
+groq>=0.11.0
