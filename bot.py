@@ -1,4 +1,3 @@
-````python
 # ============================================================
 # AI PYTHON DISCORD BOT
 # bot.py
@@ -1865,4 +1864,4 @@ if __name__ == "__main__":
         logging.info(
             "Bot stopped manually."
         )
-````
+
