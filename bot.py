@@ -64,11 +64,13 @@
 # ============================================================
 
 import os
+import sys
 import json
 import sqlite3
 import asyncio
 import logging
 import random
+import traceback
 
 from datetime import datetime, timezone, timedelta, time as dt_time
 
@@ -1002,17 +1004,35 @@ async def generate_ai_response(
     Generate an AI response using Gemini.
     """
 
-    memories = await get_user_memories(
-        user.id,
-        limit=10
-    )
+    # These DB lookups are wrapped individually so that a
+    # Postgres problem (bad DATABASE_URL, connection drop,
+    # etc.) degrades to "no memory / no history" instead of
+    # blowing up the whole response with a generic error.
+    try:
+        memories = await get_user_memories(
+            user.id,
+            limit=10
+        )
+    except Exception as error:
+        print("=" * 60, flush=True)
+        print("ERROR in get_user_memories:", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
+        memories = []
 
-    recent_messages = await get_recent_messages(
-        user.id,
-        channel_id=channel_id,
-        conversation_type=conversation_type,
-        limit=MAX_HISTORY_MESSAGES
-    )
+    try:
+        recent_messages = await get_recent_messages(
+            user.id,
+            channel_id=channel_id,
+            conversation_type=conversation_type,
+            limit=MAX_HISTORY_MESSAGES
+        )
+    except Exception as error:
+        print("=" * 60, flush=True)
+        print("ERROR in get_recent_messages:", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
+        recent_messages = []
 
     memory_text = ""
 
@@ -1908,8 +1928,16 @@ async def on_message(message):
 
     except Exception as error:
 
-        # Make sure a failure here is visible in Discord
-        # instead of silently vanishing.
+        # Make sure a failure here is impossible to miss:
+        # print a raw traceback to stdout (bypasses any
+        # logging handler/level misconfiguration) AND log it
+        # normally.
+        print("=" * 60, flush=True)
+        print("UNEXPECTED ERROR generating AI response:", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
+        sys.stdout.flush()
+
         logging.exception(
             "Unexpected error generating AI response: %s",
             error
